@@ -1,10 +1,11 @@
-from pathlib import Path
+import sys
+import os
 from dotenv import load_dotenv
+from pathlib import Path
 from datetime import datetime, timedelta
 import pandas as pd
-from email_downloader import *
+from email_downloader import download_emails, trim_dir
 from tips_io import parse_tip_email, parse_tip_emails, tips_exchange2sqlite, tips_sqlite2pandas
-
 
 load_dotenv()
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import re
 import pathlib
+from pathlib import Path
 import sqlite3
 from datetime import date, datetime
 from typing import Optional, Union
@@ -541,6 +542,9 @@ def parse_tip_email(
     html  = _get_html(eml_path)
     soup  = BeautifulSoup(html, "lxml")
     # for human testing
+    if not Path('../soup').is_dir():
+        print('making folder for soup:', Path('../soup'))
+        Path('../soup').mkdir()
     open('../soup/soup.html', 'w').write(str(soup))
 
 
