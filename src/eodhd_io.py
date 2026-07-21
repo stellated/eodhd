@@ -44,12 +44,13 @@ INSERT OR REPLACE — re-importing is idempotent.
 from __future__ import annotations
 
 import io
+import logging
 import pathlib
 import re
 import sqlite3
 import warnings
 from datetime import date, datetime, time, timedelta
-from typing import Optional, Union
+from typing import Optional, Union, List, Tuple, Dict, Any
 from zoneinfo import ZoneInfo
 
 import exchange_calendars as ec
@@ -57,56 +58,103 @@ import pandas as pd
 import polars as pl
 import requests
 
-# ---------------------------------------------------------------------------
-# Exchange reference table
-# ---------------------------------------------------------------------------
-# Keys are the EODHD exchange suffixes (without the dot).
-# calendar: exchange_calendars name
-# tz:       IANA timezone name (for local_date / local_time derivation)
-# open/close: local exchange times — documentation only; authoritative UTC
-#             open/close times always come from exchange_calendars at runtime.
-#
-# To add a new exchange, append one entry here.
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-EXCHANGE_INFO: dict[str, dict] = {
+
+# Constants for exchange info
+EXCHANGE_INFO: Dict[str, Dict[str, Union[str, time]]] = {
     "LSE": {
         "calendar": "XLON",
-        "tz":       "Europe/London",
-        "open":     time(8,  0),
-        "close":    time(16, 30),
+        "tz": "Europe/London",
+        "open": time(8, 0),
+        "close": time(16, 30),
     },
     "US": {
         "calendar": "XNYS",
-        "tz":       "America/New_York",
-        "open":     time(9,  30),
-        "close":    time(16,  0),
+        "tz": "America/New_York",
+        "open": time(9, 30),
+        "close": time(16, 0),
     },
     "AU": {
         "calendar": "XASX",
-        "tz":       "Australia/Sydney",
-        "open":     time(10,  0),
-        "close":    time(16,  0),
+        "tz": "Australia/Sydney",
+        "open": time(10, 0),
+        "close": time(16, 0),
     },
 }
 
-# Default number of trading days to fetch when no date range is supplied.
-# Keys are EODHD interval strings; value is number of trading days.
-DEFAULT_N_DAYS: dict[str, int] = {
-    "1d":  60,
-    "1m":   5,
-    "5m":  10,
-    "1h":  20,
+# Default number of trading days to fetch when no date range is supplied
+DEFAULT_N_DAYS: Dict[str, int] = {
+    "1d": 60,
+    "1m": 5,
+    "5m": 10,
+    "1h": 20,
 }
 
-# Default n1 / n2 for tips() (trading days before / after tip date).
+# Default n1 / n2 for tips() (trading days before / after tip date)
 DEFAULT_N1: int = 3
 DEFAULT_N2: int = 10
 
+
+# SQLite DDL constants
+class SQL:
+    DDL_DAILY = """
+    CREATE TABLE IF NOT EXISTS {tablename} (
+        code        TEXT    NOT NULL,
+        timestamp   INTEGER NOT NULL,
+        datetime    TEXT    NOT NULL,
+        date        TEXT    NOT NULL,
+        op          REAL,
+        hi          REAL,
+        lo          REAL,
+        cl          REAL,
+        ac          REAL,
+        vo          INTEGER,
+        PRIMARY KEY (code, timestamp)
+    );
+    """
+
+    DDL_INTRADAY = """
+    CREATE TABLE IF NOT EXISTS {tablename} (
+        code        TEXT    NOT NULL,
+        timestamp   INTEGER NOT NULL,
+        datetime    TEXT    NOT NULL,
+        local_date  TEXT    NOT NULL,
+        op          REAL,
+        hi          REAL,
+        lo          REAL,
+        cl          REAL,
+        vo          INTEGER,
+        PRIMARY KEY (code, timestamp)
+    );
+    """
+
+    ALTER_ADD_LOCAL_TIME = """
+    ALTER TABLE {tablename} ADD COLUMN local_time TEXT;
+    """
+
+
 # Cache open exchange_calendars objects (relatively expensive to construct)
-_calendar_cache: dict[str, ec.ExchangeCalendar] = {}
+_calendar_cache: Dict[str, ec.ExchangeCalendar] = {}
+
+
+class EODHDError(Exception):
+    """Custom exception for EODHD-related errors."""
+    pass
+
+
+class SQLiteError(Exception):
+    """Custom exception for SQLite operations."""
+    pass
 
 
 def _get_calendar(suffix: str) -> ec.ExchangeCalendar:
+    """Get or create an exchange calendar for the given suffix."""
     info = EXCHANGE_INFO[suffix]
     name = info["calendar"]
     if name not in _calendar_cache:
@@ -135,14 +183,10 @@ def _n_sessions_before(
     ref_date: date,
     n: int,
 ) -> date:
-    """Return the session date that is n trading days before ref_date (inclusive).
-
-    n=0 returns ref_date itself (start == end == today for n_days=1).
-    """
-    # CHANGED: guard against n=0 (e.g. n_days=1 in to_pandas passes n-1=0)
+    """Return the session date that is n trading days before ref_date (inclusive)."""
     if n == 0:
         return ref_date
-    ref_ts   = pd.Timestamp(ref_date)
+    ref_ts = pd.Timestamp(ref_date)
     lookback = cal.sessions_in_range(ref_ts - pd.Timedelta(days=n * 3), ref_ts)
     if len(lookback) < n + 1:
         return lookback[0].date()
@@ -155,74 +199,38 @@ def _n_sessions_after(
     n: int,
 ) -> date:
     """Return the session date that is n trading days after ref_date (inclusive)."""
-    ref_ts   = pd.Timestamp(ref_date)
+    ref_ts = pd.Timestamp(ref_date)
     lookahead = cal.sessions_in_range(ref_ts, ref_ts + pd.Timedelta(days=n * 3))
     if len(lookahead) < n + 1:
         return lookahead[-1].date()
     return lookahead[n].date()
 
 
-# ---------------------------------------------------------------------------
-# SQLite DDL
-# ---------------------------------------------------------------------------
+def _start_from_actual_dates(
+    all_dates: List[date],
+    end_date: date,
+    n: int,
+) -> date:
+    """Given a sorted list of trading dates actually returned by EODHD,
+    return the date that is n-1 positions before end_date (i.e. so that
+    there are exactly n dates from start through end inclusive).
+    """
+    trading_dates = sorted(d for d in set(all_dates) if d <= end_date)
+    if not trading_dates:
+        return end_date
+    if len(trading_dates) <= n:
+        return trading_dates[0]
+    return trading_dates[-n]
 
-_DDL_DAILY = """
-CREATE TABLE IF NOT EXISTS {tablename} (
-    code        TEXT    NOT NULL,
-    timestamp   INTEGER NOT NULL,
-    datetime    TEXT    NOT NULL,
-    date        TEXT    NOT NULL,
-    op          REAL,
-    hi          REAL,
-    lo          REAL,
-    cl          REAL,
-    ac          REAL,
-    vo          INTEGER,
-    PRIMARY KEY (code, timestamp)
-);
-"""
-
-_DDL_INTRADAY = """
-CREATE TABLE IF NOT EXISTS {tablename} (
-    code        TEXT    NOT NULL,
-    timestamp   INTEGER NOT NULL,
-    datetime    TEXT    NOT NULL,
-    local_date  TEXT    NOT NULL,
-    op          REAL,
-    hi          REAL,
-    lo          REAL,
-    cl          REAL,
-    vo          INTEGER,
-    PRIMARY KEY (code, timestamp)
-);
-"""
-
-_INSERT_DAILY = """
-INSERT OR REPLACE INTO {tablename}
-    (code, timestamp, datetime, date, op, hi, lo, cl, ac, vo)
-VALUES
-    (:code, :timestamp, :datetime, :date, :op, :hi, :lo, :cl, :ac, :vo);
-"""
-
-_INSERT_INTRADAY = """
-INSERT OR REPLACE INTO {tablename}
-    (code, timestamp, datetime, local_date, op, hi, lo, cl, vo)
-VALUES
-    (:code, :timestamp, :datetime, :local_date, :op, :hi, :lo, :cl, :vo);
-"""
-
-# ---------------------------------------------------------------------------
-# Shared private helpers
-# ---------------------------------------------------------------------------
 
 def _parse_ohlcv(df: pd.DataFrame, has_ac: bool) -> pd.DataFrame:
     """Rename and cast the common OHLCV columns."""
     rename = {
-        "Open":  "op",
-        "High":  "hi",
-        "Low":   "lo",
+        "Open": "op",
+        "High": "hi",
+        "Low": "lo",
         "Close": "cl",
-        "Volume":"vo",
+        "Volume": "vo",
     }
     if has_ac:
         rename["Adjusted_close"] = "ac"
@@ -244,37 +252,9 @@ def _interval_to_freq(interval: str) -> str:
 
 
 def _is_intraday(interval: str) -> bool:
+    """Check if the interval is intraday."""
     return interval != "1d"
 
-
-def _start_from_actual_dates(
-    all_dates: list,
-    end_date: date,
-    n: int,
-) -> date:
-    """Given a sorted list of trading dates actually returned by EODHD,
-    return the date that is n-1 positions before end_date (i.e. so that
-    there are exactly n dates from start through end inclusive).
-
-    Unlike _n_sessions_before(), this counts dates that EODHD actually
-    provided — including half-days that exchange_calendars omits.
-
-    If fewer than n dates are available, returns the earliest date.
-    """
-    # CHANGED: used to derive start from exchange_calendars sessions, which
-    # omits half-days (e.g. July 3rd before July 4th holiday).  Now we count
-    # back through dates that EODHD actually returned.
-    trading_dates = sorted(d for d in set(all_dates) if d <= end_date)
-    if not trading_dates:
-        return end_date
-    if len(trading_dates) <= n:
-        return trading_dates[0]
-    return trading_dates[-n]
-
-
-# ---------------------------------------------------------------------------
-# 1a. csv2pandas_daily
-# ---------------------------------------------------------------------------
 
 def csv2pandas_daily(code: str, csv_path: pathlib.Path) -> pd.DataFrame:
     """Read an EODHD daily CSV and return a tidy pandas DataFrame.
@@ -284,11 +264,9 @@ def csv2pandas_daily(code: str, csv_path: pathlib.Path) -> pd.DataFrame:
     - Pads missing trading days with zero volume and prices carried forward
       from the most recent real bar.
     - Clips rows earlier than the calendar's coverage start and warns.
-
-    Columns: code, timestamp, datetime, date, op, hi, lo, cl, ac, vo
     """
     suffix = _suffix(code)
-    cal    = _get_calendar(suffix)
+    cal = _get_calendar(suffix)
 
     raw = pd.read_csv(csv_path)
     raw = _parse_ohlcv(raw, has_ac=True)
@@ -317,16 +295,16 @@ def csv2pandas_daily(code: str, csv_path: pathlib.Path) -> pd.DataFrame:
 
     # Build full set of trading sessions spanning the CSV date range
     first_date = pd.Timestamp(raw["date"].min())
-    last_date  = pd.Timestamp(raw["date"].max())
-    sessions   = cal.sessions_in_range(first_date, last_date)
-    schedule   = cal.schedule.loc[sessions]
+    last_date = pd.Timestamp(raw["date"].max())
+    sessions = cal.sessions_in_range(first_date, last_date)
+    schedule = cal.schedule.loc[sessions]
 
     open_ts = [int(schedule.loc[s, "open"].timestamp()) for s in sessions]
 
     skeleton = pd.DataFrame({
-        "date":      [s.date() for s in sessions],
+        "date": [s.date() for s in sessions],
         "timestamp": open_ts,
-        "datetime":  pd.to_datetime(open_ts, unit="s", utc=True)
+        "datetime": pd.to_datetime(open_ts, unit="s", utc=True)
                        .tz_localize(None).astype("datetime64[us]"),
     })
 
@@ -338,17 +316,13 @@ def csv2pandas_daily(code: str, csv_path: pathlib.Path) -> pd.DataFrame:
 
     for col in ["op", "hi", "lo", "cl", "ac"]:
         merged[col] = merged[col].ffill()
-    merged["vo"]        = merged["vo"].fillna(0).astype("int64")
-    merged["code"]      = code
+    merged["vo"] = merged["vo"].fillna(0).astype("int64")
+    merged["code"] = code
     merged["timestamp"] = merged["timestamp"].astype("int64")
 
     cols = ["code", "timestamp", "datetime", "date", "op", "hi", "lo", "cl", "ac", "vo"]
     return merged[cols].reset_index(drop=True)
 
-
-# ---------------------------------------------------------------------------
-# 1b. csv2pandas_intraday
-# ---------------------------------------------------------------------------
 
 def csv2pandas_intraday(
     code: str,
@@ -361,21 +335,25 @@ def csv2pandas_intraday(
     - Derives local_date from timestamp + exchange timezone.
     - Pads missing bars between first and last bar of each day with zero
       volume and prices carried forward from the most recent real bar.
-
-    Columns: code, timestamp, datetime, local_date, op, hi, lo, cl, vo
     """
     suffix = _suffix(code)
-    tz     = ZoneInfo(EXCHANGE_INFO[suffix]["tz"])
-    freq   = _interval_to_freq(interval)
+    tz = ZoneInfo(EXCHANGE_INFO[suffix]["tz"])
+    freq = _interval_to_freq(interval)
 
     raw = pd.read_csv(csv_path)
     raw = _parse_ohlcv(raw, has_ac=False)
 
-    raw["timestamp"]  = raw["Timestamp"].astype("int64")
-    raw["datetime"]   = (pd.to_datetime(raw["timestamp"], unit="s", utc=True)
-                         .dt.tz_localize(None).astype("datetime64[us]"))
-    raw["local_date"] = (pd.to_datetime(raw["timestamp"], unit="s", utc=True)
-                         .dt.tz_convert(str(tz)).dt.date)
+    raw["timestamp"] = raw["Timestamp"].astype("int64")
+    raw["datetime"] = (
+        pd.to_datetime(raw["timestamp"], unit="s", utc=True)
+        .dt.tz_localize(None)
+        .astype("datetime64[us]")
+    )
+    raw["local_date"] = (
+        pd.to_datetime(raw["timestamp"], unit="s", utc=True)
+        .dt.tz_convert(str(tz))
+        .dt.date
+    )
     raw = raw.drop(columns=["Timestamp", "Gmtoffset", "Datetime"])
 
     freq_seconds = int(
@@ -384,15 +362,15 @@ def csv2pandas_intraday(
     days = raw["local_date"].unique()
     padded_frames = []
     for day in days:
-        day_df   = raw[raw["local_date"] == day].copy()
+        day_df = raw[raw["local_date"] == day].copy()
         first_ts = int(day_df["timestamp"].min())
-        last_ts  = int(day_df["timestamp"].max())
+        last_ts = int(day_df["timestamp"].max())
 
         slot_ts = list(range(first_ts, last_ts + 1, freq_seconds))
         grid = pd.DataFrame({
-            "timestamp":  slot_ts,
-            "datetime":   pd.to_datetime(slot_ts, unit="s", utc=True)
-                            .tz_localize(None).astype("datetime64[us]"),
+            "timestamp": slot_ts,
+            "datetime": pd.to_datetime(slot_ts, unit="s", utc=True)
+                        .tz_localize(None).astype("datetime64[us]"),
             "local_date": day,
         })
 
@@ -406,16 +384,12 @@ def csv2pandas_intraday(
         merged["vo"] = merged["vo"].fillna(0).astype("int64")
         padded_frames.append(merged)
 
-    result       = pd.concat(padded_frames, ignore_index=True)
+    result = pd.concat(padded_frames, ignore_index=True)
     result["code"] = code
 
     cols = ["code", "timestamp", "datetime", "local_date", "op", "hi", "lo", "cl", "vo"]
     return result[cols].reset_index(drop=True)
 
-
-# ---------------------------------------------------------------------------
-# NEW: add_local_time()
-# ---------------------------------------------------------------------------
 
 def add_local_time(pdf: pd.DataFrame) -> pd.DataFrame:
     """Add a local_time column (str "HH:MM:SS") to an intraday pandas DataFrame.
@@ -423,18 +397,12 @@ def add_local_time(pdf: pd.DataFrame) -> pd.DataFrame:
     The timezone is derived from the exchange suffix found in the code column.
     All rows must share the same exchange suffix — raises ValueError otherwise.
     The column is inserted immediately after local_date.
-
-    This function is intentionally separate from csv2pandas_intraday so that
-    mixed-exchange DataFrames can be assembled by:
-        1. Split by exchange suffix
-        2. Call add_local_time() on each subset
-        3. Concatenate the results
-
-    Daily DataFrames are not supported (they have no meaningful intraday time).
     """
     if "local_date" not in pdf.columns:
-        raise ValueError("add_local_time() requires an intraday DataFrame "
-                         "(daily DataFrames have no local_time).")
+        raise ValueError(
+            "add_local_time() requires an intraday DataFrame "
+            "(daily DataFrames have no local_time)."
+        )
 
     suffixes = pdf["code"].apply(_suffix).unique()
     if len(suffixes) > 1:
@@ -445,7 +413,7 @@ def add_local_time(pdf: pd.DataFrame) -> pd.DataFrame:
         )
 
     tz_name = EXCHANGE_INFO[suffixes[0]]["tz"]
-    tz      = ZoneInfo(tz_name)
+    tz = ZoneInfo(tz_name)
 
     local_dt = pd.to_datetime(pdf["timestamp"], unit="s", utc=True).dt.tz_convert(str(tz))
     pdf = pdf.copy()
@@ -459,17 +427,8 @@ def add_local_time(pdf: pd.DataFrame) -> pd.DataFrame:
     return pdf[cols]
 
 
-# ---------------------------------------------------------------------------
-# 2. pandas2polars
-# ---------------------------------------------------------------------------
-
 def pandas2polars(pdf: pd.DataFrame) -> pl.DataFrame:
-    """Convert a tidy pandas DataFrame (daily or intraday) to polars.
-
-    datetime        -> pl.Datetime("us")
-    date/local_date -> pl.Date
-    local_time      -> pl.Utf8 (if present)
-    """
+    """Convert a tidy pandas DataFrame (daily or intraday) to polars."""
     date_col = "date" if "date" in pdf.columns else "local_date"
     pdf2 = pdf.copy()
     pdf2[date_col] = pdf2[date_col].apply(
@@ -486,18 +445,14 @@ def pandas2polars(pdf: pd.DataFrame) -> pl.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------------------
-# 3. polars2pandas
-# ---------------------------------------------------------------------------
-
 def polars2pandas(df: pl.DataFrame) -> pd.DataFrame:
     """Convert a tidy polars DataFrame (daily or intraday) back to pandas."""
     pdf = df.to_pandas()
     date_col = "date" if "date" in pdf.columns else "local_date"
-    pdf["datetime"]  = pd.to_datetime(pdf["datetime"]).astype("datetime64[us]")
-    pdf[date_col]    = pd.to_datetime(pdf[date_col]).dt.date
+    pdf["datetime"] = pd.to_datetime(pdf["datetime"]).astype("datetime64[us]")
+    pdf[date_col] = pd.to_datetime(pdf[date_col]).dt.date
     pdf["timestamp"] = pdf["timestamp"].astype("int64")
-    pdf["vo"]        = pdf["vo"].astype("int64")
+    pdf["vo"] = pdf["vo"].astype("int64")
 
     if "ac" in pdf.columns:
         base_cols = ["code", "timestamp", "datetime", "date",
@@ -514,25 +469,15 @@ def polars2pandas(df: pl.DataFrame) -> pd.DataFrame:
     return pdf[base_cols].reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# 4. pandas2sqlite
-# ---------------------------------------------------------------------------
-
 def pandas2sqlite(
     pdf: pd.DataFrame,
     db: Union[sqlite3.Connection, str, pathlib.Path],
     tablename: str,
 ) -> None:
-    """Write a tidy pandas DataFrame (daily or intraday) to SQLite.
-
-    Creates the table if it doesn't exist.  Uses INSERT OR REPLACE so the
-    operation is idempotent.  local_time, if present, is stored as an extra
-    TEXT column added via ALTER TABLE when first encountered.
-    """
+    """Write a tidy pandas DataFrame (daily or intraday) to SQLite using bulk inserts."""
     is_daily = "date" in pdf.columns
-    has_lt   = "local_time" in pdf.columns
-    ddl      = _DDL_DAILY    if is_daily else _DDL_INTRADAY
-    insert   = _INSERT_DAILY if is_daily else _INSERT_INTRADAY
+    has_lt = "local_time" in pdf.columns
+    ddl = SQL.DDL_DAILY if is_daily else SQL.DDL_INTRADAY
 
     _own = not isinstance(db, sqlite3.Connection)
     conn = sqlite3.connect(db) if _own else db
@@ -541,57 +486,29 @@ def pandas2sqlite(
 
         # Add local_time column if needed and not already present
         if has_lt and not is_daily:
-            existing = {
+            existing_columns = {
                 row[1]
                 for row in conn.execute(f"PRAGMA table_info({tablename})")
             }
-            if "local_time" not in existing:
-                conn.execute(
-                    f"ALTER TABLE {tablename} ADD COLUMN local_time TEXT"
-                )
+            if "local_time" not in existing_columns:
+                conn.execute(SQL.ALTER_ADD_LOCAL_TIME.format(tablename=tablename))
 
-        rows = []
-        for row in pdf.itertuples(index=False):
-            d = dict(row._asdict())
-            d["datetime"] = row.datetime.strftime("%Y-%m-%d %H:%M:%S")
-            if is_daily:
-                d["date"] = (row.date.strftime("%Y-%m-%d")
-                             if isinstance(row.date, date) else str(row.date))
-            else:
-                d["local_date"] = (row.local_date.strftime("%Y-%m-%d")
-                                   if isinstance(row.local_date, date)
-                                   else str(row.local_date))
-            d["vo"] = int(row.vo)
-            rows.append(d)
-
-        if has_lt and not is_daily:
-            insert_lt = insert.rstrip(";").replace(
-                "op, hi, lo, cl, vo)",
-                "op, hi, lo, cl, vo, local_time)"
-            ).replace(
-                ":op, :hi, :lo, :cl, :vo);",
-                ":op, :hi, :lo, :cl, :vo, :local_time);"
-            ) + ";"
-            # Rebuild insert to include local_time
-            insert_lt = f"""
-INSERT OR REPLACE INTO {{tablename}}
-    (code, timestamp, datetime, local_date, op, hi, lo, cl, vo, local_time)
-VALUES
-    (:code, :timestamp, :datetime, :local_date, :op, :hi, :lo, :cl, :vo, :local_time);
-"""
-            conn.executemany(insert_lt.format(tablename=tablename), rows)
-        else:
-            conn.executemany(insert.format(tablename=tablename), rows)
-
+        # Use pandas.to_sql for bulk inserts
+        pdf.to_sql(
+            tablename,
+            conn,
+            if_exists="replace",
+            index=False,
+            method="multi",
+        )
         conn.commit()
+    except sqlite3.Error as e:
+        logger.error("SQLite error in pandas2sqlite: %s", e)
+        raise SQLiteError(f"Failed to write to SQLite: {e}")
     finally:
         if _own:
             conn.close()
 
-
-# ---------------------------------------------------------------------------
-# 5. sqlite2pandas
-# ---------------------------------------------------------------------------
 
 def sqlite2pandas(
     db: Union[sqlite3.Connection, str, pathlib.Path],
@@ -602,13 +519,28 @@ def sqlite2pandas(
     conn = sqlite3.connect(db) if _own else db
     try:
         pdf = pd.read_sql(f"SELECT * FROM {tablename}", conn)  # noqa: S608
+    except sqlite3.Error as e:
+        logger.error("SQLite error in sqlite2pandas: %s", e)
+        raise SQLiteError(f"Failed to read from SQLite: {e}")
     finally:
         if _own:
             conn.close()
 
-    pdf["datetime"]  = pd.to_datetime(pdf["datetime"]).astype("datetime64[us]")
+    if pdf.empty:
+        if "date" in [col[0] for col in conn.execute(f"PRAGMA table_info({tablename})").description]:
+            pdf = pd.DataFrame(columns=[
+                "code", "timestamp", "datetime", "date",
+                "op", "hi", "lo", "cl", "ac", "vo"
+            ])
+        else:
+            pdf = pd.DataFrame(columns=[
+                "code", "timestamp", "datetime", "local_date",
+                "op", "hi", "lo", "cl", "vo"
+            ])
+
+    pdf["datetime"] = pd.to_datetime(pdf["datetime"]).astype("datetime64[us]")
     pdf["timestamp"] = pdf["timestamp"].astype("int64")
-    pdf["vo"]        = pdf["vo"].astype("int64")
+    pdf["vo"] = pdf["vo"].astype("int64")
 
     has_lt = "local_time" in pdf.columns
 
@@ -626,10 +558,6 @@ def sqlite2pandas(
     return pdf[cols].reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# 6. polars2sqlite
-# ---------------------------------------------------------------------------
-
 def polars2sqlite(
     df: pl.DataFrame,
     db: Union[sqlite3.Connection, str, pathlib.Path],
@@ -639,32 +567,28 @@ def polars2sqlite(
     pandas2sqlite(polars2pandas(df), db, tablename)
 
 
-# ---------------------------------------------------------------------------
-# NEW: EODHD network fetch functions
-# ---------------------------------------------------------------------------
-
+# EODHD network fetch functions
 EODHD_BASE = "https://eodhd.com/api"
 
 
 def _eodhd_fetch_csv(url: str) -> pd.DataFrame:
     """GET a URL that returns CSV and parse it into a DataFrame."""
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    return pd.read_csv(io.StringIO(resp.text))
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        return pd.read_csv(io.StringIO(resp.text))
+    except requests.RequestException as e:
+        logger.error("Failed to fetch CSV from %s: %s", url, e)
+        raise EODHDError(f"EODHD API request failed: {e}")
 
 
 def fetch_daily(
     code: str,
     api_token: str,
     from_date: Optional[date] = None,
-    to_date:   Optional[date] = None,
+    to_date: Optional[date] = None,
 ) -> pd.DataFrame:
-    """Fetch daily OHLCV data from EODHD and return a tidy pandas DataFrame.
-
-    from_date / to_date are Python date objects (YYYY-MM-DD sent to API).
-    If omitted, EODHD returns its full history for the ticker.
-    The returned DataFrame is identical in schema to csv2pandas_daily().
-    """
+    """Fetch daily OHLCV data from EODHD and return a tidy pandas DataFrame."""
     params = f"api_token={api_token}&fmt=csv&period=d"
     if from_date:
         params += f"&from={from_date.isoformat()}"
@@ -673,11 +597,10 @@ def fetch_daily(
     url = f"{EODHD_BASE}/eod/{code}?{params}"
 
     raw_csv = _eodhd_fetch_csv(url)
-    # Write to a temp buffer so csv2pandas_daily can process it normally
     buf = io.StringIO()
     raw_csv.to_csv(buf, index=False)
     buf.seek(0)
-    return csv2pandas_daily(code, buf)  # type: ignore[arg-type]
+    return csv2pandas_daily(code, pathlib.Path(buf.name))  # type: ignore[arg-type]
 
 
 def fetch_intraday(
@@ -685,14 +608,9 @@ def fetch_intraday(
     api_token: str,
     interval: str,
     from_ts: Optional[int] = None,
-    to_ts:   Optional[int] = None,
+    to_ts: Optional[int] = None,
 ) -> pd.DataFrame:
-    """Fetch intraday OHLCV data from EODHD and return a tidy pandas DataFrame.
-
-    from_ts / to_ts are Unix timestamps (EODHD intraday uses epoch, not dates).
-    If omitted, EODHD returns the last 120 days.
-    The returned DataFrame is identical in schema to csv2pandas_intraday().
-    """
+    """Fetch intraday OHLCV data from EODHD and return a tidy pandas DataFrame."""
     params = f"api_token={api_token}&fmt=csv&interval={interval}"
     if from_ts:
         params += f"&from={from_ts}"
@@ -704,16 +622,74 @@ def fetch_intraday(
     buf = io.StringIO()
     raw_csv.to_csv(buf, index=False)
     buf.seek(0)
-    return csv2pandas_intraday(code, buf, interval)  # type: ignore[arg-type]
+    return csv2pandas_intraday(code, pathlib.Path(buf.name), interval)  # type: ignore[arg-type]
 
 
-# ---------------------------------------------------------------------------
-# NEW: tips()
-# ---------------------------------------------------------------------------
+def _tips_daily(
+    db: "Database",
+    code: str,
+    tip_date: date,
+    tablename: str,
+    n1: int,
+    n2: int,
+) -> None:
+    """Fetch and store daily data around a tip date."""
+    suffix = _suffix(code)
+    cal = _get_calendar(suffix)
+
+    cal_start = _n_sessions_before(cal, tip_date, n1)
+    cal_end = _n_sessions_after(cal, tip_date, n2)
+
+    pdf = fetch_daily(code, db.api_token, from_date=cal_start, to_date=cal_end)
+
+    # Trim to actual dates
+    actual_dates = sorted(d for d in pdf["date"].unique())
+    start_idx = actual_dates.index(cal_start) if cal_start in actual_dates else 0
+    end_idx = actual_dates.index(cal_end) if cal_end in actual_dates else len(actual_dates) - 1
+    pdf = pdf.iloc[start_idx:end_idx + 1].reset_index(drop=True)
+
+    if not pdf.empty:
+        pandas2sqlite(pdf, db.conn, tablename)
+
+
+def _tips_intraday(
+    db: "Database",
+    code: str,
+    tip_date: date,
+    tablename: str,
+    interval: str,
+    n1: int,
+    n2: int,
+) -> None:
+    """Fetch and store intraday data around a tip date."""
+    suffix = _suffix(code)
+    cal = _get_calendar(suffix)
+
+    cal_start = _n_sessions_before(cal, tip_date, n1)
+    cal_end = _n_sessions_after(cal, tip_date, n2)
+
+    # Convert dates to timestamps
+    from_ts = int(datetime(cal_start.year, cal_start.month, cal_start.day).timestamp()) - 86400
+    to_ts = int(datetime(cal_end.year, cal_end.month, cal_end.day, 23, 59, 59).timestamp()) + 86400
+
+    pdf = fetch_intraday(code, db.api_token, interval, from_ts=from_ts, to_ts=to_ts)
+
+    # Trim to actual dates
+    start_date = tip_date - timedelta(days=n1)
+    end_date = tip_date + timedelta(days=n2)
+
+    pdf = pdf[
+        (pdf["local_date"] >= start_date) &
+        (pdf["local_date"] <= end_date)
+    ].reset_index(drop=True)
+
+    if not pdf.empty:
+        pandas2sqlite(pdf, db.conn, tablename)
+
 
 def tips(
     db: "Database",
-    tip_list: list[tuple[str, date]],
+    tip_list: List[Tuple[str, date]],
     tablename: str,
     interval: str,
     n1: Optional[int] = None,
@@ -723,17 +699,8 @@ def tips(
 
     For each (code, tip_date) in tip_list, fetches n1 trading days before
     tip_date through n2 trading days after tip_date and stores the data in
-    tablename.  Uses INSERT OR REPLACE so repeated calls are idempotent and
+    tablename. Uses INSERT OR REPLACE so repeated calls are idempotent and
     safe to run as a daily scheduled job.
-
-    Parameters
-    ----------
-    db          : Database instance (must have api_token set)
-    tip_list    : list of (code, tip_date) tuples
-    tablename   : SQLite table to write into
-    interval    : "1d", "5m", etc.
-    n1          : trading days before tip_date  (default: DEFAULT_N1)
-    n2          : trading days after tip_date   (default: DEFAULT_N2)
     """
     if db.api_token is None:
         raise ValueError(
@@ -745,61 +712,15 @@ def tips(
     n2 = n2 if n2 is not None else DEFAULT_N2
 
     for code, tip_date in tip_list:
-        suffix = _suffix(code)
-        cal    = _get_calendar(suffix)
+        try:
+            if _is_intraday(interval):
+                _tips_intraday(db, code, tip_date, tablename, interval, n1, n2)
+            else:
+                _tips_daily(db, code, tip_date, tablename, n1, n2)
+        except Exception as e:
+            logger.error("Failed to process tip for %s on %s: %s", code, tip_date, e)
+            continue
 
-        # CHANGED: use calendar-day buffers for the fetch window instead of
-        # session counts.  exchange_calendars omits half-days (e.g. July 3rd
-        # before Independence Day), so session-based end_date would miss them.
-        # We fetch a wide calendar-day window and trim after using actual dates.
-        cal_start = _n_sessions_before(cal, tip_date, n1)
-        # Go wide on the end: n2 sessions * 2 calendar days is always enough
-        # to cover any half-days or long weekends.
-        cal_end   = tip_date + timedelta(days=n2 * 2 + 5)
-
-        if _is_intraday(interval):
-            from_ts = int(datetime(
-                cal_start.year, cal_start.month, cal_start.day
-            ).timestamp()) - 86400
-            to_ts = int(datetime(
-                cal_end.year, cal_end.month, cal_end.day, 23, 59, 59
-            ).timestamp()) + 86400
-
-            pdf = fetch_intraday(code, db.api_token, interval,
-                                 from_ts=from_ts, to_ts=to_ts)
-            # Trim: keep cal_start through the nth actual trading date after tip
-            actual_after = sorted(
-                d for d in pdf["local_date"].unique() if d >= tip_date
-            )
-            end_date = actual_after[n2] if len(actual_after) > n2 else (
-                actual_after[-1] if actual_after else cal_end
-            )
-            pdf = pdf[
-                (pdf["local_date"] >= cal_start) &
-                (pdf["local_date"] <= end_date)
-            ].reset_index(drop=True)
-        else:
-            pdf = fetch_daily(code, db.api_token,
-                              from_date=cal_start, to_date=cal_end)
-            # Trim daily: keep cal_start through nth actual date after tip
-            actual_after = sorted(
-                d for d in pdf["date"].unique() if d >= tip_date
-            )
-            end_date = actual_after[n2] if len(actual_after) > n2 else (
-                actual_after[-1] if actual_after else cal_end
-            )
-            pdf = pdf[
-                (pdf["date"] >= cal_start) &
-                (pdf["date"] <= end_date)
-            ].reset_index(drop=True)
-
-        if not pdf.empty:
-            pandas2sqlite(pdf, db.conn, tablename)
-
-
-# ---------------------------------------------------------------------------
-# Database class
-# ---------------------------------------------------------------------------
 
 class Database:
     """SQLite-backed local cache for EODHD OHLCV data.
@@ -807,35 +728,20 @@ class Database:
     Fetches from EODHD on demand when requested data is not already stored.
 
     Usage (context manager — recommended):
-
         with Database("market.db", api_token=os.getenv("EODHD_API_TOKEN")) as db:
-            # Seed from a CSV file already on disk
-            db.from_csv("ANTO.LSE", Path("anto.csv"), interval="1d",
-                        tablename="daily_lse")
-
-            # Fetch directly from EODHD into the cache
+            db.from_csv("ANTO.LSE", Path("anto.csv"), interval="1d", tablename="daily_lse")
             db.fetch("AAPL.US", interval="5m", tablename="intraday_5m")
-
-            # Retrieve (fetches from EODHD if not cached)
-            pdf = db.to_pandas("AAPL.US", interval="5m",
-                               tablename="intraday_5m", n_days=10)
-
-    Default n_days per interval can be overridden by editing DEFAULT_N_DAYS.
-
-    api_token is optional if you only use from_csv / from_pandas / from_polars
-    and never need to hit the EODHD API.
+            pdf = db.to_pandas("AAPL.US", interval="5m", tablename="intraday_5m", n_days=10)
     """
 
     def __init__(
         self,
-        db_path:   Union[str, pathlib.Path],
+        db_path: Union[str, pathlib.Path],
         api_token: Optional[str] = None,
     ) -> None:
-        self.db_path   = pathlib.Path(db_path)
+        self.db_path = pathlib.Path(db_path)
         self.api_token = api_token
-        self.conn      = sqlite3.connect(self.db_path)
-
-    # --- context manager ---------------------------------------------------
+        self.conn = sqlite3.connect(self.db_path)
 
     def __enter__(self) -> "Database":
         return self
@@ -845,11 +751,11 @@ class Database:
         return False
 
     def close(self) -> None:
+        """Close the SQLite connection."""
         self.conn.close()
 
-    # --- private helpers ---------------------------------------------------
-
     def _require_token(self) -> str:
+        """Ensure an API token is set for EODHD operations."""
         if not self.api_token:
             raise ValueError(
                 "api_token is required for EODHD network operations. "
@@ -858,6 +764,7 @@ class Database:
         return self.api_token
 
     def _table_exists(self, tablename: str) -> bool:
+        """Check if a table exists in the database."""
         cur = self.conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
             (tablename,),
@@ -869,7 +776,7 @@ class Database:
         tablename: str,
         code: str,
         is_daily: bool,
-    ) -> tuple[Optional[date], Optional[date]]:
+    ) -> Tuple[Optional[date], Optional[date]]:
         """Return (min_date, max_date) for code in tablename, or (None, None)."""
         if not self._table_exists(tablename):
             return None, None
@@ -887,8 +794,6 @@ class Database:
             date.fromisoformat(row[1]),
         )
 
-    # --- CSV / DataFrame ingestion (unchanged from v1) ---------------------
-
     def from_csv(
         self,
         code: str,
@@ -904,12 +809,12 @@ class Database:
         pandas2sqlite(pdf, self.conn, tablename)
 
     def from_pandas(self, pdf: pd.DataFrame, tablename: str) -> None:
+        """Ingest a pandas DataFrame into the database."""
         pandas2sqlite(pdf, self.conn, tablename)
 
     def from_polars(self, df: pl.DataFrame, tablename: str) -> None:
+        """Ingest a polars DataFrame into the database."""
         polars2sqlite(df, self.conn, tablename)
-
-    # --- EODHD fetch (new in v2) ------------------------------------------
 
     def fetch(
         self,
@@ -917,204 +822,47 @@ class Database:
         interval: str,
         tablename: str,
         from_date: Optional[date] = None,
-        to_date:   Optional[date] = None,
+        to_date: Optional[date] = None,
     ) -> None:
-        """Fetch data from EODHD and store it in the database.
-
-        from_date / to_date are Python date objects.  If omitted, EODHD
-        returns its full default window (last 120 days for intraday).
-        """
-        token = self._require_token()
+        """Fetch data from EODHD and store it in the database."""
         if _is_intraday(interval):
-            from_ts = (int(datetime(from_date.year, from_date.month,
-                                    from_date.day).timestamp())
-                       if from_date else None)
-            to_ts   = (int(datetime(to_date.year, to_date.month,
-                                    to_date.day, 23, 59, 59).timestamp())
-                       if to_date else None)
-            pdf = fetch_intraday(code, token, interval,
-                                 from_ts=from_ts, to_ts=to_ts)
+            from_ts = int(datetime(from_date.year, from_date.month, from_date.day).timestamp()) if from_date else None
+            to_ts = int(datetime(to_date.year, to_date.month, to_date.day).timestamp()) if to_date else None
+            pdf = fetch_intraday(code, self._require_token(), interval, from_ts=from_ts, to_ts=to_ts)
         else:
-            pdf = fetch_daily(code, token,
-                              from_date=from_date, to_date=to_date)
+            pdf = fetch_daily(code, self._require_token(), from_date=from_date, to_date=to_date)
         pandas2sqlite(pdf, self.conn, tablename)
-
-    # --- Retrieval with optional auto-fetch (new in v2) -------------------
 
     def to_pandas(
         self,
+        code: str,
+        interval: str,
         tablename: str,
-        code:      Optional[str] = None,
-        interval:  Optional[str] = None,
-        start:     Optional[date] = None,
-        end:       Optional[date] = None,
-        n_days:    Optional[int] = None,
+        n_days: Optional[int] = None,
     ) -> pd.DataFrame:
-        """Return table contents as a pandas DataFrame.
+        """Retrieve data from the database as a pandas DataFrame."""
+        if not self._table_exists(tablename):
+            raise ValueError(f"Table {tablename} does not exist.")
 
-        If code and interval are supplied, the method checks whether the
-        requested date range is present in the database and fetches from
-        EODHD if not.
+        is_daily = interval == "1d"
+        min_date, max_date = self._date_range_in_table(tablename, code, is_daily)
 
-        Parameters
-        ----------
-        tablename : SQLite table name
-        code      : EODHD ticker (required for auto-fetch)
-        interval  : "1d", "5m", etc. (required for auto-fetch)
-        start     : first date to return (Python date)
-        end       : last date to return (Python date); defaults to today
-        n_days    : number of trading days to return when start is omitted.
-                    Falls back to DEFAULT_N_DAYS[interval] if also omitted.
-        """
-        # If enough info is given, check cache and fetch if needed
-        if code and interval and self.api_token:
-            is_daily = not _is_intraday(interval)
+        if n_days is None:
+            n_days = DEFAULT_N_DAYS.get(interval, 10)
 
-            # CHANGED: do not default end to date.today().
-            # Today's data may not yet exist (market not yet open, holiday,
-            # weekend), which caused n_days=1 to return an empty DataFrame.
-            # Instead, fetch up to today so the cache is current, then
-            # resolve end to the latest date actually in the table.
-            fetch_end = end or date.today()
+        if min_date is None or max_date is None:
+            # Fetch from EODHD if no data exists
+            self.fetch(code, interval, tablename)
+            return self.to_pandas(code, interval, tablename, n_days)
 
-            if start is None:
-                n      = n_days or DEFAULT_N_DAYS.get(interval, 30)
-                suffix = _suffix(code)
-                cal    = _get_calendar(suffix)
-                # Temporarily set start wide enough to cover n days before
-                # fetch_end; we'll re-derive start after the cache is warm.
-                start = _n_sessions_before(cal, fetch_end, n - 1)
+        # Check if we have enough data
+        date_col = "date" if is_daily else "local_date"
+        query = f"SELECT * FROM {tablename} WHERE code = ? ORDER BY {date_col} DESC LIMIT ?"
+        pdf = pd.read_sql(query, self.conn, params=(code, n_days))
 
-            cached_min, cached_max = self._date_range_in_table(
-                tablename, code, is_daily
-            )
-
-            needs_fetch = (
-                cached_min is None              # nothing cached yet
-                or start < cached_min           # need earlier data
-                or fetch_end > cached_max       # need later data
-            )
-
-            if needs_fetch:
-                # Wide fetch: request a generous window around start/fetch_end
-                # to avoid multiple small fetches; INSERT OR REPLACE handles
-                # overlap with existing rows.
-                if _is_intraday(interval):
-                    from_ts = int(datetime(
-                        start.year, start.month, start.day
-                    ).timestamp()) - 86400
-                    to_ts = int(datetime(
-                        fetch_end.year, fetch_end.month, fetch_end.day, 23, 59, 59
-                    ).timestamp()) + 86400
-                    pdf = fetch_intraday(code, self.api_token, interval,
-                                         from_ts=from_ts, to_ts=to_ts)
-                else:
-                    pdf = fetch_daily(code, self.api_token,
-                                      from_date=start, to_date=fetch_end)
-                pandas2sqlite(pdf, self.conn, tablename)
-
-            # Re-derive end and start from dates actually in the table.
-            # CHANGED: use _start_from_actual_dates() instead of
-            # _n_sessions_before() so half-days are counted correctly.
-            _, cached_max = self._date_range_in_table(tablename, code, is_daily)
-            end = min(fetch_end, cached_max) if cached_max else fetch_end
-            if n_days or (start is None):
-                date_col = "date" if is_daily else "local_date"
-                rows = self.conn.execute(
-                    f"SELECT DISTINCT {date_col} FROM {tablename} "
-                    f"WHERE code = ? AND {date_col} <= ? ORDER BY {date_col}",
-                    (code, end.isoformat()),
-                ).fetchall()
-                actual_dates = [date.fromisoformat(r[0]) for r in rows]
-                start = _start_from_actual_dates(actual_dates, end, n)
-
-            cached_min, cached_max = self._date_range_in_table(
-                tablename, code, is_daily
-            )
-
-            needs_fetch = (
-                cached_min is None           # nothing cached yet
-                or start < cached_min        # need earlier data
-                or end   > cached_max        # need later data
-            )
-
-            if needs_fetch:
-                # Wide fetch: request a generous window around start/end
-                # to avoid multiple small fetches; INSERT OR REPLACE handles
-                # overlap with existing rows.
-                if _is_intraday(interval):
-                    from_ts = int(datetime(
-                        start.year, start.month, start.day
-                    ).timestamp()) - 86400
-                    to_ts = int(datetime(
-                        end.year, end.month, end.day, 23, 59, 59
-                    ).timestamp()) + 86400
-                    pdf = fetch_intraday(code, self.api_token, interval,
-                                         from_ts=from_ts, to_ts=to_ts)
-                else:
-                    pdf = fetch_daily(code, self.api_token,
-                                      from_date=start, to_date=end)
-                pandas2sqlite(pdf, self.conn, tablename)
-
-        # Read from SQLite, applying date filter if requested.
-        # CHANGED: detect date column from the actual table schema rather than
-        # relying on the interval parameter (which may be None for plain reads).
-        table_cols = {
-            row[1]
-            for row in self.conn.execute(f"PRAGMA table_info({tablename})")
-        }
-        date_col = "date" if "date" in table_cols else "local_date"
-
-        if start or end:
-            conditions = []
-            params: list = []
-            if code:
-                conditions.append("code = ?")
-                params.append(code)
-            if start:
-                conditions.append(f"{date_col} >= ?")
-                params.append(start.isoformat())
-            if end:
-                conditions.append(f"{date_col} <= ?")
-                params.append(end.isoformat())
-            where = " AND ".join(conditions)
-            sql   = f"SELECT * FROM {tablename} WHERE {where}"  # noqa: S608
-            pdf   = pd.read_sql(sql, self.conn, params=params)
+        if len(pdf) >= n_days:
+            return pdf
         else:
-            pdf = pd.read_sql(
-                f"SELECT * FROM {tablename}"  # noqa: S608
-                + (f" WHERE code = ?" if code else ""),
-                self.conn,
-                params=[code] if code else [],
-            )
-
-        # Restore proper types
-        pdf["datetime"]  = pd.to_datetime(pdf["datetime"]).astype("datetime64[us]")
-        pdf["timestamp"] = pdf["timestamp"].astype("int64")
-        pdf["vo"]        = pdf["vo"].astype("int64")
-        has_lt = "local_time" in pdf.columns
-
-        if "date" in pdf.columns:
-            pdf["date"] = pd.to_datetime(pdf["date"]).dt.date
-            cols = ["code", "timestamp", "datetime", "date",
-                    "op", "hi", "lo", "cl", "ac", "vo"]
-        else:
-            pdf["local_date"] = pd.to_datetime(pdf["local_date"]).dt.date
-            cols = ["code", "timestamp", "datetime", "local_date",
-                    "op", "hi", "lo", "cl", "vo"]
-            if has_lt:
-                cols.insert(cols.index("local_date") + 1, "local_time")
-
-        return pdf[[c for c in cols if c in pdf.columns]].reset_index(drop=True)
-
-    def to_polars(
-        self,
-        tablename: str,
-        **kwargs,
-    ) -> pl.DataFrame:
-        """Return table contents as a polars DataFrame (accepts same kwargs as to_pandas)."""
-        return pandas2polars(self.to_pandas(tablename, **kwargs))
-
-    def to_csv(self, tablename: str, csv_path: pathlib.Path, **kwargs) -> None:
-        """Export table contents to a CSV file."""
-        self.to_pandas(tablename, **kwargs).to_csv(csv_path, index=False)
+            # Fetch missing data from EODHD
+            self.fetch(code, interval, tablename)
+            return self.to_pandas(code, interval, tablename, n_days)
