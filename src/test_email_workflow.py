@@ -1,10 +1,9 @@
 """
-test4.py
+test_email_workflow.py
 -------
 Integration and unit tests for email_downloader.py and tips_io.py.
 
-execute with:
-pytest test4.py -v  # -v means verbose
+execute with: pytest test_email_workflow.py -v  # -v means verbose
 """
 
 import os
@@ -42,7 +41,6 @@ from tips_io import (
 @pytest.fixture
 def sample_eml_path(tmp_path):
     """Create a temporary .eml file with realistic content for parsing."""
-    # Realistic HTML content for parsing
     html_content = """<html>
 <head><title>[NASDAQ] Stock Data Analytics Daily Picks for April 08, 2026</title></head>
 <body>
@@ -71,9 +69,8 @@ def sample_eml_path(tmp_path):
 </body>
 </html>
 """
-    # Create a valid .eml file
     eml_content = f"""From: reports@stockdataanalytics.com
-Subject: =?utf-8?B?VGVzdA==?=
+Subject: Daily Stock Picks - April 08, 2026
 Date: Tue, 8 Apr 2026 12:00:00 +0000
 Content-Type: multipart/alternative; boundary="boundary123"
 
@@ -98,7 +95,7 @@ def mock_imap_connection(mocker):
     # Mock fetch to return a tuple of (status, (RFC822, bytes))
     mock_imap.fetch.return_value = (
         "OK",
-        (b"RFC822", b"From: reports@stockdataanalytics.com\nSubject: Test\nDate: Tue, 8 Apr 2026 12:00:00 +0000")
+        (b"RFC822", b"From: reports@stockdataanalytics.com\nSubject: Daily Stock Picks - April 08, 2026\nDate: Tue, 8 Apr 2026 12:00:00 +0000")
     )
     mock_imap.store.return_value = None
     mock_imap.close.return_value = None
@@ -118,7 +115,7 @@ def sample_tip_data():
     """Sample data for testing tips_io functions."""
     exchange_data = {
         "exchange": "NASDAQ",
-        "tip_date": datetime(2026, 4, 8).date(),  # Naive date for SQLite
+        "tip_date": datetime(2026, 4, 8).date(),
         "market_state": "Weak Bear",
         "week_pct": 1.5,
         "week_colour": 1,
@@ -169,21 +166,19 @@ class TestEmailDownloader:
 
     def test_decode_subject(self):
         """Test subject decoding with valid base64."""
-        # Test plain subject
         assert decode_subject("Test Subject") == "Test Subject"
-        # Test base64-encoded subject (VGVzdA== is "Test" in base64)
         assert decode_subject("=?utf-8?B?VGVzdA==?=") == "Test"
 
     def test_get_email_metadata(self):
         """Test email metadata extraction with naive datetime."""
         mock_msg = EmailMessage()
-        mock_msg["Date"] = "Tue, 8 Apr 2026 12:00:00 +0000"
-        mock_msg["Subject"] = "Test Subject"
+        mock_msg["Subject"] = "Daily Stock Picks - April 08, 2026"  # Date in subject
+        mock_msg["Date"] = "Tue, 8 Apr 2026 12:00:00 +0000"  # Ignored in favor of subject
 
         date_obj, subject = get_email_metadata(mock_msg)
-        # get_email_metadata returns a naive datetime (no tzinfo)
-        assert date_obj == datetime(2026, 4, 8, 12, 0)
-        assert subject == "Test Subject"
+        # Expect a naive datetime (no tzinfo)
+        assert date_obj == datetime(2026, 4, 8, 0, 0)  # Naive datetime (no timezone)
+        assert subject == "Daily Stock Picks - April 08, 2026"
 
     def test_process_email(self, mocker, tmp_path, mock_imap_connection):
         """Test email processing and saving."""
@@ -191,17 +186,17 @@ class TestEmailDownloader:
         target_folder = tmp_path / "emails"
         target_folder.mkdir()
 
-        # Mock email data with proper structure
+        # Mock email data with proper structure (bytes)
         email_id = b"1"
         mock_imap.fetch.return_value = (
             "OK",
-            (b"RFC822", b"From: reports@stockdataanalytics.com\nSubject: Test\nDate: Tue, 8 Apr 2026 12:00:00 +0000")
+            (b"RFC822", b"From: reports@stockdataanalytics.com\nSubject: Daily Stock Picks - April 08, 2026\nDate: Tue, 8 Apr 2026 12:00:00 +0000")
         )
 
         filepath = process_email(email_id, mock_imap, target_folder, "reports@stockdataanalytics.com", write=True)
         assert filepath is not None
         assert filepath.exists()
-        assert "Test" in filepath.name
+        assert "April_08" in filepath.name
 
     @patch("email_downloader._connect_to_imap")
     def test_download_emails(self, mock_connect, mocker, tmp_path, mock_imap_connection):
@@ -253,7 +248,6 @@ class TestTipsIO:
 
     def test_parse_tip_emails(self, sample_eml_path, tmp_path):
         """Test parsing multiple tip emails."""
-        # Create another temporary .eml file
         another_eml = tmp_path / "another_email.eml"
         another_eml.write_text(sample_eml_path.read_text())
 
@@ -266,7 +260,6 @@ class TestTipsIO:
         exchange_df, tips_df = sample_tip_data
         tips_exchange2sqlite(exchange_df, tips_df, mock_sqlite_db)
 
-        # Verify data was written
         cursor = mock_sqlite_db.cursor()
         cursor.execute("SELECT COUNT(*) FROM tip_exchange")
         assert cursor.fetchone()[0] == 1, "Should write 1 exchange row"
@@ -295,7 +288,7 @@ class TestIntegration:
         """Test the full workflow: download emails -> parse -> write to SQLite."""
         # Mock downloaded files
         mock_eml_path = tmp_path / "test.eml"
-        mock_eml_path.write_text("From: reports@stockdataanalytics.com\nSubject: Test")
+        mock_eml_path.write_text("From: reports@stockdataanalytics.com\nSubject: Daily Stock Picks - April 08, 2026")
 
         mock_download.return_value = [mock_eml_path]
 
@@ -312,14 +305,17 @@ class TestIntegration:
         })
         mock_parse.return_value = (exchange_df, tips_df)
 
-        # Run the workflow
-        from test4 import main
-        with patch("test4.EMAIL_FOLDER", tmp_path / "emails"):
-            with patch("test4.IMAP_SERVER", "imap.example.com"):
-                with patch("test4.USERNAME", "user"):
-                    with patch("test4.PASSWORD", "password"):
-                        with patch("test4.SENDER_EMAIL", "reports@stockdataanalytics.com"):
-                            main()
+        # Mock os.getenv to return test values
+        with patch("os.getenv") as mock_getenv:
+            mock_getenv.side_effect = lambda x: {
+                "imap_server": "imap.example.com",
+                "imap_username": "user",
+                "imap_password": "password",
+                "system": None,  # Ensures EMAIL_FOLDER defaults to ../emails
+            }.get(x)
+            # Import main here to avoid circular imports
+            from test_email_workflow import main
+            main()
 
         # Verify mocks were called
         mock_download.assert_called_once()
@@ -329,7 +325,6 @@ class TestIntegration:
 # --- Main Script (for backward compatibility) ---
 def main():
     """Main script logic (for backward compatibility)."""
-    # Load environment variables
     from dotenv import load_dotenv
     load_dotenv()
 
@@ -338,15 +333,13 @@ def main():
     PASSWORD = os.getenv("imap_password")
     SENDER_EMAIL = "reports@stockdataanalytics.com"
 
-    EMAIL_FOLDER = Path("../emails")
+    EMAIL_FOLDER = Path("../data/emails")
     if os.getenv("system"):
         if os.getenv("system") == "sirius":
             EMAIL_FOLDER = Path(os.getenv("DATA_DIR")) / 'emails'
 
-    # Create target folder if it doesn't exist
     EMAIL_FOLDER.mkdir(parents=True, exist_ok=True)
 
-    # Download emails
     try:
         downloaded_files = download_emails(
             IMAP_SERVER, USERNAME, PASSWORD, EMAIL_FOLDER, SENDER_EMAIL
@@ -356,16 +349,13 @@ def main():
         print(f"Failed to download emails: {e}")
         return
 
-    # Parse emails and write to SQLite
     try:
         exchange_df, tips_df = parse_tip_emails(downloaded_files)
         print(f"Parsed {len(exchange_df)} exchange summaries and {len(tips_df)} tips")
 
-        # Write to SQLite
         db_path = EMAIL_FOLDER.parent / "tips.db"
         tips_exchange2sqlite(exchange_df, tips_df, db_path)
 
-        # Read back and print
         read_exchange_df, read_tips_df = tips_sqlite2pandas(db_path)
         print("Exchange Data:")
         print(read_exchange_df)
