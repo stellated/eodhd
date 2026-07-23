@@ -37,21 +37,21 @@ else:
     EMAIL_FOLDER.mkdir()
 
 # download_emails() is good, moving on to next part
-download_emails(IMAP_SERVER, USERNAME, PASSWORD, EMAIL_FOLDER, SENDER_EMAIL)
+# download_emails(IMAP_SERVER, USERNAME, PASSWORD, EMAIL_FOLDER, SENDER_EMAIL)
 
 # testing extraction of data from sample_emails
-# for eml_file in sorted(list(EMAIL_FOLDER.glob("*.eml"))):
-#     print(eml_file.stem.split('_')[0])
-#     file_date = datetime.strptime(eml_file.stem.split("_")[0], "%Y-%m-%d")
-#     if datetime.today() - file_date > timedelta(days=30):
-#         continue
-#     print('*', eml_file)
-#     exchange_df, tips_df = parse_tip_email(eml_file)
-#     print('exchange_df')
-#     with pd.option_context('display.max_columns', None):
-#         print(exchange_df)
-#     print()
-#     print('tips_df')
-#     with pd.option_context('display.max_columns', None):
-#         print(tips_df)
-#     raise Exception
+for eml_file in sorted(list(EMAIL_FOLDER.glob("*.eml"))):
+    print(eml_file.stem.split('_')[0])
+    file_date = datetime.strptime(eml_file.stem.split("_")[0], "%Y-%m-%d")
+    if datetime.today() - file_date > timedelta(days=30):
+        continue
+    print('*', eml_file)
+    exchange_df, tips_df = parse_tip_email(eml_file)
+    print('exchange_df')
+    with pd.option_context('display.max_columns', None):
+        print(exchange_df)
+    print()
+    print('tips_df')
+    with pd.option_context('display.max_columns', None):
+        print(tips_df)
+    raise Exception
