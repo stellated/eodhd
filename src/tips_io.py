@@ -518,7 +518,7 @@ def _parse_tip_card(card_td, tip_n: int) -> Dict[str, Any]:
         return _parse_new_format(card_td, tip_n)
 
 
-def parse_tip_email(eml_path: pathlib.Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def parse_tip_email(eml_path: pathlib.Path, soup_folder=None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Parse a single StockDataAnalytics tip email (.eml file).
 
     Returns:
@@ -532,6 +532,10 @@ def parse_tip_email(eml_path: pathlib.Path) -> Tuple[pd.DataFrame, pd.DataFrame]
     """
     html = _get_html(eml_path)
     soup = BeautifulSoup(html, "lxml")
+    if soup_folder:
+        with open(soup_folder / eml_path.name.replace('.eml', '.html'), 'w') as f:
+            f.write(str(soup))
+
 
     # Exchange summary
     exc = _parse_exchange(soup, eml_path)

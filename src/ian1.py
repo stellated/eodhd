@@ -36,6 +36,9 @@ else:
     print(f"saving sample_emails to: {trim_dir(EMAIL_FOLDER)}, (which doesn't exist, creating now)")
     EMAIL_FOLDER.mkdir()
 
+if test_data:
+    soup_folder = Path("../data/soup")
+
 # download_emails() is good, moving on to next part
 # download_emails(IMAP_SERVER, USERNAME, PASSWORD, EMAIL_FOLDER, SENDER_EMAIL)
 
@@ -46,7 +49,7 @@ for eml_file in sorted(list(EMAIL_FOLDER.glob("*.eml"))):
     if datetime.today() - file_date > timedelta(days=30):
         continue
     print('*', eml_file)
-    exchange_df, tips_df = parse_tip_email(eml_file)
+    exchange_df, tips_df = parse_tip_email(eml_file, soup_folder=soup_folder)
     print('exchange_df')
     with pd.option_context('display.max_columns', None):
         print(exchange_df)
