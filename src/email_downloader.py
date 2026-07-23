@@ -5,7 +5,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Generator, Tuple
+from typing import Optional, List, Tuple
 from dotenv import load_dotenv
 from email.header import decode_header
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -18,22 +18,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-DEFAULT_TARGET_FOLDER = Path("../emails")
+DEFAULT_TARGET_FOLDER = Path("../data/emails")
 DEFAULT_SENDER_EMAIL = "reports@stockdataanalytics.com"
 IMAP_FOLDER = "Inbox/SDA"
 MAX_RETRIES = 3
 RETRY_WAIT_SECONDS = 2
 
-
 class EmailDownloadError(Exception):
     """Custom exception for email download failures."""
     pass
 
-
 class IMAPConnectionError(Exception):
     """Custom exception for IMAP connection failures."""
     pass
-
 
 @retry(
     stop=stop_after_attempt(MAX_RETRIES),
@@ -50,19 +47,16 @@ def _connect_to_imap(imap_server: str, username: str, password: str) -> imaplib.
         logger.warning("IMAP connection failed: %s. Retrying...", e)
         raise IMAPConnectionError(f"Failed to connect to IMAP server: {e}")
 
-
 def trim_dir(folder: Path) -> str:
     """Trim the directory path for cleaner logging output."""
     return str(folder).replace("/Users/ianatkinson/Library/CloudStorage/OneDrive-Personal", "~")
-
 
 def sanitize_filename(filename: str) -> str:
     """Sanitize the filename to remove invalid characters."""
     return re.sub(r'[^a-zA-Z0-9\s\-_.]', '', filename)  # Allow letters, numbers, spaces, hyphens, underscores, and dots
 
-
 def decode_subject(subject: str) -> str:
-    """Decode an email subject header."""
+    """Decode an email subject header, handling MIME-encoded subjects."""
     decoded_parts = decode_header(subject)
     decoded_subject = []
     for part, encoding in decoded_parts:
@@ -72,43 +66,57 @@ def decode_subject(subject: str) -> str:
             decoded_subject.append(str(part))
     return "".join(decoded_subject)
 
-
 def get_email_metadata(email_message: email.message.Message) -> Tuple[Optional[datetime], str]:
     """
     Extract date and subject from an email message.
-
-    Args:
-        email_message: Parsed email message.
-
-    Returns:
-        Tuple of (date, subject). Date is None if parsing fails.
+    Tries to parse the date from:
+    1. The subject line (e.g., "April 09, 2026").
+    2. The standard Date header (unlikely to exist in your case).
+    3. The first Received header (fallback).
     """
-    date_str = email_message["Date"]
     subject = email_message["Subject"] or "no_subject"
+    decoded_subject = decode_subject(subject)
 
+    # Try to extract date from subject (e.g., "April 09, 2026")
+    date_match = re.search(
+        r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b',
+        decoded_subject
+    )
+    if date_match:
+        try:
+            date_str = date_match.group(0)
+            date_obj = datetime.strptime(date_str, "%B %d, %Y")
+            return date_obj, decoded_subject
+        except ValueError as e:
+            logger.warning("Failed to parse date from subject '%s': %s", decoded_subject, e)
+
+    # Try standard Date header (unlikely to exist, but for completeness)
+    date_str = email_message["Date"]
     if date_str:
         try:
             date_obj = datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S %z")
-            return date_obj, subject
-        except ValueError:
-            logger.warning("Failed to parse date from header: %s", date_str)
-            # Fallback: Extract date from message header
-            try:
-                msg_bytes = email_message.as_bytes()
-                msg_str = msg_bytes.decode('utf-8', errors='replace')
-                parts = msg_str.split("Received")
-                if len(parts) > 1:
-                    second_part = parts[1]
-                    lines = second_part.split('\n')
-                    for line in lines:
-                        if "Date:" in line:
-                            date_str_fallback = line.split("Date:")[1].strip()
-                            date_obj = datetime.strptime(date_str_fallback, "%a, %d %b %Y %H:%M:%S %z")
-                            return date_obj, subject
-            except (ValueError, IndexError, AttributeError) as e:
-                logger.warning("Fallback date parsing failed: %s", e)
-    return None, subject
+            return date_obj.replace(tzinfo=None), decoded_subject
+        except ValueError as e:
+            logger.warning("Failed to parse Date header '%s': %s", date_str, e)
 
+    # Try first Received header (fallback)
+    received_headers = email_message.get_all("Received", [])
+    if received_headers:
+        try:
+            # Example: "Thu, 9 Apr 2026 16:37:05 +1000"
+            first_received = received_headers[0]
+            date_match = re.search(
+                r'\w{3},\s+\d{1,2}\s+\w{3}\s+\d{4}\s+\d{2}:\d{2}:\d{2}\s+[+-]\d{4}',
+                first_received
+            )
+            if date_match:
+                date_str = date_match.group(0)
+                date_obj = datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S %z")
+                return date_obj.replace(tzinfo=None), decoded_subject
+        except (ValueError, AttributeError) as e:
+            logger.warning("Failed to parse Received header: %s", e)
+
+    return None, decoded_subject  # No date found
 
 def process_email(
     email_id: bytes,
@@ -119,14 +127,12 @@ def process_email(
 ) -> Optional[Path]:
     """
     Process a single email: fetch, parse, and save to disk.
-
     Args:
         email_id: IMAP email ID.
         mail: IMAP connection.
         target_folder: Directory to save the email.
         sender_email: Expected sender email (for validation).
         write: If True, save the email to disk.
-
     Returns:
         Path to the saved email file, or None if skipped/failed.
     """
@@ -147,7 +153,7 @@ def process_email(
 
         date_obj, subject = get_email_metadata(email_message)
         if date_obj is None:
-            logger.warning("Skipping email with invalid date: %s", subject)
+            logger.warning("Skipping email with no date: %s", subject)
             return None
 
         date_str = date_obj.strftime("%Y-%m-%d_%H-%M-%S")
@@ -182,7 +188,6 @@ def process_email(
         logger.error("Failed to process email ID %s: %s", email_id, e)
         raise EmailDownloadError(f"Email processing failed: {e}")
 
-
 def download_emails(
     imap_server: str,
     username: str,
@@ -193,7 +198,6 @@ def download_emails(
 ) -> List[Path]:
     """
     Download emails from an IMAP server and save them to a target folder.
-
     Args:
         imap_server: IMAP server address.
         username: IMAP username.
@@ -201,7 +205,6 @@ def download_emails(
         target_folder: Directory to save downloaded emails.
         sender_email: Email address to filter messages.
         write: If True, save emails to disk. If False, only log.
-
     Returns:
         List of paths to downloaded email files.
     """
@@ -231,13 +234,12 @@ def download_emails(
 
     except IMAPConnectionError as e:
         logger.error("IMAP connection failed after retries: %s", e)
-        raise
+        raise EmailDownloadError(f"IMAP connection failed: {e}")
     except Exception as e:
         logger.error("Unexpected error during email download: %s", e)
         raise EmailDownloadError(f"Email download failed: {e}")
 
     return downloaded_files
-
 
 @retry(
     stop=stop_after_attempt(MAX_RETRIES),
@@ -256,7 +258,6 @@ def download_emails_with_retry(
     Wrapper for download_emails with retry logic for the entire operation.
     """
     return download_emails(imap_server, username, password, target_folder, sender_email, write)
-
 
 if __name__ == '__main__':
     # Configuration
