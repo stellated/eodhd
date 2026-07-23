@@ -1,7 +1,7 @@
 """
 tips_io.py
 ----------
-Parsing and persistence helpers for StockDataAnalytics daily tip emails.
+Parsing and persistence helpers for StockDataAnalytics daily tip sample_emails.
 
 Parses .eml files into two pandas DataFrames:
   exchange_df  -- one row per email with exchange-level summary data
@@ -606,7 +606,7 @@ def parse_tip_emails(eml_paths: List[pathlib.Path]) -> Tuple[pd.DataFrame, pd.Da
     """Parse multiple .eml files and concatenate results.
 
     Returns:
-        (exchange_df, tips_df): DataFrames with rows from all emails.
+        (exchange_df, tips_df): DataFrames with rows from all sample_emails.
     """
     exc_frames, tip_frames = [], []
     for path in eml_paths:

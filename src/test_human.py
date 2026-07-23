@@ -20,26 +20,26 @@ PASSWORD = os.environ["imap_password"]
 SENDER_EMAIL = "reports@stockdataanalytics.com"
 
 if test_data:
-    EMAIL_FOLDER = Path("../data/emails")  # default
+    EMAIL_FOLDER = Path("../data/sample_emails")  # default
 else:
     print(os.getenv("system"))
     if os.getenv("system"):
         if os.getenv("system") == "sirius":
-            EMAIL_FOLDER = Path(os.getenv("DATA_DIR")) / 'emails'
+            EMAIL_FOLDER = Path(os.getenv("DATA_DIR")) / 'sample_emails'
     else:
         print("os.getenv('system') does not exist")
     print("EMAIL_FOLDER", trim_dir(EMAIL_FOLDER))
 # Create target folder if it doesn't exist
 if EMAIL_FOLDER.is_dir():
-    print(f"saving emails to: {trim_dir(EMAIL_FOLDER)}")
+    print(f"saving sample_emails to: {trim_dir(EMAIL_FOLDER)}")
 else:
-    print(f"saving emails to: {trim_dir(EMAIL_FOLDER)}, (which doesn't exist, creating now)")
+    print(f"saving sample_emails to: {trim_dir(EMAIL_FOLDER)}, (which doesn't exist, creating now)")
     EMAIL_FOLDER.mkdir()
 
 # download_emails() is good, moving on to next part
 download_emails(IMAP_SERVER, USERNAME, PASSWORD, EMAIL_FOLDER, SENDER_EMAIL)
 
-# testing extraction of data from emails
+# testing extraction of data from sample_emails
 # for eml_file in sorted(list(EMAIL_FOLDER.glob("*.eml"))):
 #     print(eml_file.stem.split('_')[0])
 #     file_date = datetime.strptime(eml_file.stem.split("_")[0], "%Y-%m-%d")

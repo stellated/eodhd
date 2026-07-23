@@ -18,7 +18,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-DEFAULT_TARGET_FOLDER = Path("../data/emails")
+DEFAULT_TARGET_FOLDER = Path("../data/sample_emails")
 DEFAULT_SENDER_EMAIL = "reports@stockdataanalytics.com"
 IMAP_FOLDER = "Inbox/SDA"
 MAX_RETRIES = 3
@@ -142,7 +142,17 @@ def process_email(
             logger.warning("Failed to fetch email ID: %s", email_id)
             return None
 
-        raw_email = msg_data[0][1]
+        # Correctly extract the email bytes from the IMAP response
+        # msg_data is a tuple like: (b'RFC822', b'From: ...')
+        # The actual email data is in msg_data[1] (the second element of the tuple)
+        if isinstance(msg_data, tuple) and len(msg_data) > 1:
+            raw_email = msg_data[1]
+            if isinstance(raw_email, tuple):
+                # If raw_email is a tuple (e.g., (b'RFC822', b'From: ...')), extract the second element
+                raw_email = raw_email[1] if len(raw_email) > 1 else raw_email
+        else:
+            raw_email = msg_data
+
         email_message = email.message_from_bytes(raw_email)
 
         # Validate sender
@@ -175,7 +185,7 @@ def process_email(
         if write:
             filepath.parent.mkdir(parents=True, exist_ok=True)
             with open(filepath, "wb") as f:
-                f.write(msg_data[0][1])
+                f.write(raw_email)
             logger.info("Downloaded: %s to %s", filename, trim_dir(target_folder))
             # Mark as read
             mail.store(email_id, "+FLAGS", "\\Seen")
@@ -197,14 +207,14 @@ def download_emails(
     write: bool = True,
 ) -> List[Path]:
     """
-    Download emails from an IMAP server and save them to a target folder.
+    Download sample_emails from an IMAP server and save them to a target folder.
     Args:
         imap_server: IMAP server address.
         username: IMAP username.
         password: IMAP password.
-        target_folder: Directory to save downloaded emails.
+        target_folder: Directory to save downloaded sample_emails.
         sender_email: Email address to filter messages.
-        write: If True, save emails to disk. If False, only log.
+        write: If True, save sample_emails to disk. If False, only log.
     Returns:
         List of paths to downloaded email files.
     """
@@ -214,13 +224,27 @@ def download_emails(
         with _connect_to_imap(imap_server, username, password) as mail:
             mail.select(IMAP_FOLDER)
 
-            # Search for emails from the specified sender
+            # Search for sample_emails from the specified sender
             status, messages = mail.search(None, f'(FROM "{sender_email}")')
             if status != "OK":
                 logger.warning("No messages found for sender: %s", sender_email)
                 return downloaded_files
 
-            email_ids = messages[0].split()
+            # Correctly extract the message IDs from the IMAP response
+            # messages is a tuple like: (b'1 2 3',)
+            # The actual message IDs are in messages[0]
+            if isinstance(messages, tuple) and len(messages) > 0:
+                message_ids = messages[0]
+            else:
+                message_ids = messages
+
+            if isinstance(message_ids, bytes):
+                email_ids = message_ids.split()
+            elif isinstance(message_ids, str):
+                email_ids = message_ids.split()
+            else:
+                email_ids = []
+
             logger.info("Found %d messages from %s", len(email_ids), sender_email)
 
             for email_id in email_ids:
@@ -263,27 +287,27 @@ if __name__ == '__main__':
     # Configuration
     load_dotenv()
     IMAP_SERVER = os.getenv("imap_server")
-    USERNAME = os.getenv("username")
-    PASSWORD = os.getenv("password")
+    USERNAME = os.getenv("imap_username")
+    PASSWORD = os.getenv("imap_password")
 
     if not all([IMAP_SERVER, USERNAME, PASSWORD]):
-        raise ValueError("Missing required environment variables: imap_server, username, or password")
+        raise ValueError("Missing required environment variables: imap_server, imap_username, or imap_password")
 
     TARGET_FOLDER = DEFAULT_TARGET_FOLDER
     if os.getenv("system"):
         if os.getenv("system") == "sirius":
-            TARGET_FOLDER = Path(os.getenv("DATA_DIR")) / 'emails'
+            TARGET_FOLDER = Path(os.getenv("DATA_DIR")) / 'sample_emails'
 
     # Create target folder if it doesn't exist
     TARGET_FOLDER.mkdir(parents=True, exist_ok=True)
-    logger.info("Saving emails to: %s", trim_dir(TARGET_FOLDER))
+    logger.info("Saving sample_emails to: %s", trim_dir(TARGET_FOLDER))
 
     # Run the script
     try:
         downloaded_files = download_emails_with_retry(
             IMAP_SERVER, USERNAME, PASSWORD, TARGET_FOLDER
         )
-        logger.info("Downloaded %d emails", len(downloaded_files))
+        logger.info("Downloaded %d sample_emails", len(downloaded_files))
     except Exception as e:
         logger.error("Script failed: %s", e)
         raise
